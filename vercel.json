@@ -1,0 +1,13 @@
+{
+  "functions": {
+    "api/agent.js": {
+      "includeFiles": "artifacts/**",
+      "maxDuration": 60,
+      "memory": 1769
+    }
+  },
+  "rewrites": [
+    { "source": "/agent", "destination": "/api/agent" },
+    { "source": "/health", "destination": "/api/agent" }
+  ]
+}

@@ -7,10 +7,12 @@ const { decideAction } = require('./strategy');
 const AGENT_PATH = process.env.AGENT_PATH || '/agent';
 const PORT = process.env.PORT || 8080;
 const SECRET = process.env.AGENT_GAMES_HMAC_SECRET || ''; // set via Rotate Secret
-const GATEKEEPER_WASM = '/root/agentgames/artifacts/gatekeeper.wasm';
-const GATEKEEPER_ZKEY = '/root/agentgames/artifacts/gatekeeper_final.zkey';
-const VFY_WASM = '/root/agentgames/artifacts/vfy-policy.wasm';
-const VFY_ZKEY = '/root/agentgames/artifacts/vfy-policy_final.zkey';
+const path = require('path');
+const ARTIFACTS = path.join(__dirname, 'artifacts');
+const GATEKEEPER_WASM = path.join(ARTIFACTS, 'gatekeeper.wasm');
+const GATEKEEPER_ZKEY = path.join(ARTIFACTS, 'gatekeeper_final.zkey');
+const VFY_WASM = path.join(ARTIFACTS, 'vfy-policy.wasm');
+const VFY_ZKEY = path.join(ARTIFACTS, 'vfy-policy_final.zkey');
 const VFY_VK_HASH = '0x6c56509f1c56fd1fd4e9737f906d2220f4b95f1d507f1adf6899085bd74be047';
 
 const seen = { proofs: new Set(), idem: new Set() }; // replay guards
@@ -120,7 +122,8 @@ async function groth16(wasm, zkey, signals) {
 const { signMessage } = require('viem/accounts');
 const WALLET_PK = process.env.AGENT_WALLET_PK || '';
 
-const server = http.createServer(async (req, res) => {
+// ---------- Request handler (shared by local server & serverless) ----------
+async function handleRequest(req, res) {
   if (req.method === 'GET' && req.url === '/health') {
     return respond(res, 200, { ok: true, uptime: process.uptime() });
   }
@@ -243,7 +246,12 @@ const server = http.createServer(async (req, res) => {
     console.log('!! handler error:', e.message);
     return respond(res, 200, { decision: 'REJECT', reason_code: 'INTERNAL_ERROR' });
   }
-});
+}
 
-if (!SECRET) console.log('WARNING: AGENT_GAMES_HMAC_SECRET not set — set it via Rotate Secret before preflight.');
-server.listen(PORT, () => console.log(`agent listening on :${PORT}${process.env.AGENT_PATH || ' (AGENT_PATH unset -> /agent)'}`));
+module.exports = { handleRequest };
+
+if (require.main === module) {
+  if (!SECRET) console.log('WARNING: AGENT_GAMES_HMAC_SECRET not set — set it via Rotate Secret before preflight.');
+  const server = http.createServer(handleRequest);
+  server.listen(PORT, () => console.log(`agent listening on :${PORT}${process.env.AGENT_PATH || ' (AGENT_PATH unset -> /agent)'}`));
+}

@@ -3,3 +3,5 @@ node_modules/
 wallets/
 *.txt
 artifacts/
+.vercel
+.env*
