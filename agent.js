@@ -17,6 +17,12 @@ const VFY_VK_HASH = '0x6c56509f1c56fd1fd4e9737f906d2220f4b95f1d507f1adf6899085bd
 
 const seen = { proofs: new Set(), idem: new Set() }; // replay guards
 const matchHistory = new Map(); // matchId -> [{turn, opponentAction}]
+// Steal the VFY strategy commitment: keccak256(word(extractCap=10) || word(version=1) || salt32)
+// Salt at .strategy-salt; registered on the dashboard when entry opens.
+const REGISTERED_COMMITMENT = (() => {
+  try { return process.env.AGENT_STRATEGY_COMMITMENT || require('fs').readFileSync(path.join(__dirname, '.strategy-commitment'), 'utf8').trim(); }
+  catch { return ''; }
+})();
 
 function sign(body) {
   return crypto.createHmac('sha256', SECRET).update(body).digest('hex');
@@ -215,28 +221,29 @@ async function handleRequest(req, res) {
 
     // ---- Steal the VFY ----
     if (env.eventId === 'steal-the-vfy' || env.type === 'agent-games.steal-the-vfy.v1') {
+      const vfy = require('./vfy');
       const h = matchHistory.get(env.matchId) || [];
       const action = decideAction(env.state, h);
-      const amount = action.type === 'EXTRACT' ? action.amount : undefined;
-      const payload = {
-        matchId: env.matchId,
-        turn: env.turn,
-        action: amount !== undefined ? { type: action.type, amount } : { type: action.type },
-        policyProof: { circuitVersion: 'v1' },
-        agentTimestamp: new Date().toISOString(),
-        idempotencyKey: crypto.randomUUID(),
-      };
-      if (seen.idem.has(payload.idempotencyKey)) payload.idempotencyKey = crypto.randomUUID();
-      seen.idem.add(payload.idempotencyKey);
+      const envelope = { ...env, state: env.state };
+      // vfy.js chooses the same max-extract action; use its full response builder
+      // (publicInputsHash in the guide's 8-word order + public_signals + UUID idem key).
+      const payload = vfy.buildTurnResponse({ ...envelope, state: env.state }, new Date(), REGISTERED_COMMITMENT);
+      // Respect our richer strategy for the action instead of max-extract
+      payload.action = action.type === 'EXTRACT' ? { type: 'EXTRACT', amount: action.amount } : { type: action.type };
       try {
-        const pih = await publicInputsHash(
-          (env.strategyCommitment || {}).hash || '0',
-          env.matchId, env.turn,
-          env.state.selfBalance, env.state.opponentBalance,
-          action.type, amount
-        );
-        payload.policyProof.publicInputsHash = pih;
-        // TODO: local Groth16 proof + Kurier submission once KURIER_API_KEY is set.
+        const vfy2 = vfy;
+        payload.policyProof.publicInputsHash = vfy2.publicInputsHash({
+          commitment: (env.strategyCommitment || {}).hash || REGISTERED_COMMITMENT,
+          matchId: env.matchId, turn: env.turn,
+          selfBalance: env.state.selfBalance, opponentBalance: env.state.opponentBalance,
+          action, circuitVersion: payload.policyProof.circuitVersion,
+        });
+        payload.policyProof.public_signals = vfy2.buildPublicSignals({
+          commitment: (env.strategyCommitment || {}).hash || REGISTERED_COMMITMENT,
+          matchId: env.matchId, turn: env.turn,
+          selfBalance: env.state.selfBalance, opponentBalance: env.state.opponentBalance,
+          action, circuitVersion: payload.policyProof.circuitVersion,
+        });
       } catch (e) { console.log('publicInputsHash failed:', e.message); }
       return respond(res, 200, payload);
     }
