@@ -1,0 +1,5 @@
+agent listening on :8080 (AGENT_PATH unset -> /agent)
+IN sig: 86f5221be473034f5896d8054339746b1b45ab42ef9f35d50929b21bae3c0672 len: 64
+-> 200 {"ok":true,"protocolVersion":"v1"}
+IN sig: cd2867d2a6748448dc44cda95e01fac340e0e55bd8b30e81c3ffa82b5794937e len: 64
+-> 200 {"ok":true,"protocolVersion":"v1"}

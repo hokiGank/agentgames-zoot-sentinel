@@ -30,7 +30,7 @@ function verify(raw, sig) {
 
 function respond(res, status, obj) {
   const body = JSON.stringify(obj);
-  res.writeHead(status, { 'content-type': 'application/json' });
+  res.writeHead(status, { 'content-type': 'application/json', 'x-agent-games-signature': sign(body) });
   res.end(body);
   console.log(`-> ${status}`, body.slice(0, 300));
 }
@@ -39,16 +39,59 @@ function respond(res, status, obj) {
 function gatekeeperDecide(input) {
   const checks = [
     ['VK_SUBSTITUTION', () => input.proof_vk !== input.registered_vk],
-    ['EXPIRED', () => Number(input.current_block) >= Number(input.expiry_block)],
-    ['INSUFFICIENT_BALANCE', () => BigInt(input.public_balance) < BigInt(input.minimum)],
-    ['AMOUNT_EXCEEDED', () => BigInt(input.amount) > BigInt(input.max_transfer)],
+    ['EXPIRED_CONDITION', () => Number(input.current_block) >= Number(input.expiry_block)],
+    ['THRESHOLD_MISMATCH', () => BigInt(input.public_balance) < BigInt(input.minimum)],
+    ['AMOUNT_OVERFLOW', () => BigInt(input.amount) > BigInt(input.max_transfer)],
     ['RECIPIENT_MISMATCH', () => input.recipient !== input.condition_recipient],
     ['MISSING_PROOF_TX', () => !input.proof_tx],
   ];
   for (const [code, fail] of checks) {
     if (fail()) return { decision: 'REJECT', reason_code: code, proof_tx: input.proof_tx };
   }
-  return { decision: 'APPROVE', reason_code: 'ALL_CHECKS_PASS', proof_tx: input.proof_tx };
+  return { decision: 'APPROVE', reason_code: 'VALID_CONDITION', proof_tx: input.proof_tx };
+}
+
+// ---------- Groth16 prover (gatekeeper circuit) ----------
+const BN128_PRIME = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+
+function toFieldElement(v) {
+  let n;
+  const s = String(v).trim();
+  if (/^0x[0-9a-fA-F]+$/.test(s)) n = BigInt(s);
+  else if (/^[0-9]+$/.test(s)) n = BigInt(s);
+  else n = BigInt('0x' + crypto.createHash('sha256').update(s).digest('hex'));
+  return ((n % BN128_PRIME) + BN128_PRIME) % BN128_PRIME;
+}
+
+// Deterministic per-task private salt (HMAC-bound, reproducible on redelivery).
+function deriveSalt(taskId) {
+  const d = crypto.createHmac('sha256', SECRET || 'gatekeeper-local-dev').update(`gatekeeper-salt:${taskId}`).digest();
+  return BigInt('0x' + d.toString('hex')) % BN128_PRIME;
+}
+
+// Circuit inputs: mirror the field checks exactly — witness generation for a
+// wrong decision bit fails, so the circuit is the referee.
+function buildCircuitInputs(env, input, decision, salt) {
+  return {
+    taskId: toFieldElement(env.task_id),
+    registeredVkHash: toFieldElement(input.registered_vk),
+    proofVkHash: toFieldElement(input.proof_vk),
+    minimum: BigInt(input.minimum).toString(10),
+    publicBalance: BigInt(input.public_balance).toString(10),
+    expiryBlock: BigInt(input.expiry_block).toString(10),
+    currentBlock: BigInt(input.current_block).toString(10),
+    recipient: toFieldElement(input.recipient),
+    conditionRecipient: toFieldElement(input.condition_recipient),
+    amount: BigInt(input.amount).toString(10),
+    maxTransfer: BigInt(input.max_transfer).toString(10),
+    decision: decision === 'APPROVE' ? '1' : '0',
+    salt: salt.toString(10),
+  };
+}
+
+async function groth16Prove(circuitInputs) {
+  const snarkjs = require('snarkjs');
+  return snarkjs.groth16.fullProve(circuitInputs, GATEKEEPER_WASM, GATEKEEPER_ZKEY);
 }
 
 // ---------- Steal the VFY publicInputsHash (per spec, keccak256 ABI-packed) ----------
@@ -125,7 +168,9 @@ const server = http.createServer(async (req, res) => {
   const raw = Buffer.concat(chunks);
 
   const sig = req.headers['x-agent-games-signature'];
+  console.log('IN sig:', String(sig).slice(0, 80), 'len:', sig ? String(sig).length : 0);
   if (!verify(raw, sig)) {
+    console.log('!! HMAC mismatch; expected:', sign(raw).slice(0, 30), 'got:', String(sig || '').slice(0, 30));
     console.log('!! HMAC mismatch');
     return respond(res, 401, { ok: false, error: 'signature mismatch' });
   }
@@ -142,10 +187,27 @@ const server = http.createServer(async (req, res) => {
 
     // ---- Proof Gatekeeper ----
     if (env.type === 'agent-games.proof-gatekeeper.v1') {
-      const decision = gatekeeperDecide(env.input || {});
-      // TODO (practice-mode validation): if APPROVE, generate + submit Groth16 proof
-      // via gatekeeper circuit and attach { proof, public_signals } before first scored round.
-      return respond(res, 200, decision);
+      const input = env.input || {};
+      // Decision first (VK substitution outranks reuse); reuse is unprovable.
+      const decision = gatekeeperDecide(input);
+      if (input.proof_tx && seen.proofs.has(String(input.proof_tx).toLowerCase()) &&
+          decision.reason_code !== 'VK_SUBSTITUTION') {
+        return respond(res, 200, { decision: 'REJECT', reason_code: 'PROOF_REUSED', proof_tx: input.proof_tx });
+      }
+      let response = { ...decision };
+      try {
+        const circuitInputs = buildCircuitInputs(env, input, decision.decision, deriveSalt(env.task_id));
+        const { proof, publicSignals } = await groth16Prove(circuitInputs);
+        response.proof = proof;
+        response.public_signals = publicSignals;
+      } catch (e) {
+        // Fail closed: a claimed decision without a valid proof is the worst
+        // outcome. Downgrade any decision to REJECT with no proof.
+        console.log('!! proof generation failed:', e.message.slice(0, 200));
+        response = { decision: 'REJECT', reason_code: 'INVALID_TASK', proof_tx: input.proof_tx };
+      }
+      if (input.proof_tx) seen.proofs.add(String(input.proof_tx).toLowerCase());
+      return respond(res, 200, response);
     }
 
     // ---- Steal the VFY ----
