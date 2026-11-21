@@ -67,7 +67,13 @@ function toFieldElement(v) {
   const s = String(v).trim();
   if (/^0x[0-9a-fA-F]+$/.test(s)) n = BigInt(s);
   else if (/^[0-9]+$/.test(s)) n = BigInt(s);
-  else n = BigInt('0x' + crypto.createHash('sha256').update(s).digest('hex'));
+  else {
+    // Platform convention (validated on-chain): taskId public signal = trailing UUID
+    // read as a 128-bit hex BigInt, NOT a hash of the whole string.
+    const m = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(s);
+    if (m) n = BigInt('0x' + m[1].replace(/-/g, ''));
+    else n = BigInt('0x' + crypto.createHash('sha256').update(s).digest('hex'));
+  }
   return ((n % BN128_PRIME) + BN128_PRIME) % BN128_PRIME;
 }
 
